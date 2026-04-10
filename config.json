@@ -1,0 +1,38 @@
+{
+  "pip_path": "./.venv/Scripts/pip.exe",
+  "tasks": [
+    {
+      "name": "Minecraft 补全",
+      "type": "plugin_operation",
+      "operation_command": "minecraft_mirror_start",
+      "time": {
+        "type": "interval",
+        "hours": 0,
+        "minutes": 0,
+        "seconds": 12
+      }
+    },
+    {
+      "name": "Codename CURE 服务器检视",
+      "type": "plugin_operation",
+      "operation_command": "cure_server",
+      "time": {
+        "type": "interval",
+        "hours": 0,
+        "minutes": 0,
+        "seconds": 10
+      }
+    },
+    {
+      "name": "Cloudflare DNS更新",
+      "type": "plugin_operation",
+      "operation_command": "cf2dns_dnspod",
+      "time": {
+        "type": "interval",
+        "hours": 0,
+        "minutes": 30,
+        "seconds": 0
+      }
+    }
+  ]
+}

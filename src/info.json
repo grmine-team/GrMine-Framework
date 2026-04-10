@@ -1,0 +1,22 @@
+{
+  "package_name": "grmine.use.a+b",
+  "plugin_name": "GrUSEA+B",
+  "plugin_info": "GrMine 导入测试插件",
+  "entrance": "main",
+  "author": "bytfr",
+  "version": "1.0.0",
+  "author_info": "Email: 2678509244@qq.com",
+  "grapi_version": "2.0",
+  "dependent_plugin": [
+    "grmine.a+b"
+  ],
+  "modules": [
+    {
+      "import_name": "fastapi",
+      "module_name": "fastapi",
+      "version": "0.128.8",
+      "bundled": true
+    }
+  ],
+  "python_version": ">=3.8"
+}
