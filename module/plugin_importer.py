@@ -9,6 +9,7 @@ import types
 import platform
 import tempfile
 import os
+import struct
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Any, Set, Tuple, List
 
@@ -33,6 +34,10 @@ class PluginInfo:
     loaded_modules: Dict[str, types.ModuleType] = field(default_factory=dict)
     bundled_modules: Set[str] = field(default_factory=set)
     platform_modules: Dict[str, str] = field(default_factory=dict)
+    # 预解压的平台二进制文件临时目录
+    ext_temp_dir: Optional[str] = None
+    # DLL 搜索目录令牌 (Windows add_dll_directory)
+    dll_directory_tokens: list = field(default_factory=list)
 
 
 class PluginImporter(importlib.abc.MetaPathFinder, importlib.abc.Loader):
@@ -65,16 +70,130 @@ class PluginImporter(importlib.abc.MetaPathFinder, importlib.abc.Loader):
         plugin_hash = hashlib.sha256(package_name.encode()).hexdigest()[:16]
         libs_prefix = f"grapi.plugin_libs.{plugin_hash}"
         bundled_modules, platform_modules = cls._scan_bundled_modules(zip_importer)
+
+        # 如果有平台特定的二进制模块，预解压到临时目录
+        ext_temp_dir = None
+        dll_directory_tokens = []
+        if platform_modules:
+            ext_temp_dir = cls._preextract_platform_libs(zip_importer)
+            if ext_temp_dir:
+                # 将临时目录加入 sys.path，使 Python 标准导入和 ctypes 都能找到模块
+                if ext_temp_dir not in sys.path:
+                    sys.path.insert(0, ext_temp_dir)
+                # Windows: 加入 DLL 搜索路径
+                if platform.system() == 'Windows' and hasattr(os, 'add_dll_directory'):
+                    try:
+                        token = os.add_dll_directory(ext_temp_dir)
+                        dll_directory_tokens.append(token)
+                    except OSError:
+                        pass
+
         instance._plugin_importers[package_name] = PluginInfo(
             zip_importer=zip_importer,
             libs_prefix=libs_prefix,
             plugin_hash=plugin_hash,
             bundled_modules=bundled_modules,
             platform_modules=platform_modules,
+            ext_temp_dir=ext_temp_dir,
+            dll_directory_tokens=dll_directory_tokens,
         )
         if instance not in sys.meta_path:
             sys.meta_path.insert(0, instance)
         return libs_prefix
+
+    @classmethod
+    def _preextract_platform_libs(cls, zip_imp: zipimport.zipimporter) -> Optional[str]:
+        """将 libs/ 和 libs/{platform}/ 下的所有文件预解压到临时目录，供 ctypes/原生加载使用。
+        先解压 libs/ 下的通用文件，再覆盖 libs/{platform}/ 下的平台特定文件。"""
+        current_platform = cls._current_platform
+        platform_prefix = f"{current_platform}/"
+        temp_dir = tempfile.mkdtemp(prefix='grmine_plat_')
+
+        try:
+            # 第一轮：解压 libs/ 下的通用文件（非平台特定）
+            for file_path in zip_imp._files:
+                normalized = file_path.replace('\\', '/')
+                if not normalized.startswith('libs/'):
+                    continue
+                remaining = normalized[5:]
+                if not remaining:
+                    continue
+                # 跳过平台特定目录下的文件（第二轮处理）
+                for plat_key in ('win-amd64', 'win-x86', 'linux-x86_64', 'linux-aarch64', 'macos-x86_64', 'macos-arm64'):
+                    if remaining.startswith(plat_key + '/'):
+                        remaining = None
+                        break
+                if remaining is None:
+                    continue
+
+                lower = remaining.lower()
+                if lower.endswith('.pyc') or lower.endswith('.pyo'):
+                    continue
+                if '/__pycache__/' in remaining:
+                    continue
+
+                try:
+                    data = zip_imp.get_data(file_path)
+                    parts = remaining.replace('/', os.sep)
+                    dir_part = os.path.dirname(parts)
+                    filename = os.path.basename(parts)
+
+                    target_dir = os.path.join(temp_dir, dir_part) if dir_part else temp_dir
+                    os.makedirs(target_dir, exist_ok=True)
+                    target_path = os.path.join(target_dir, filename)
+                    with open(target_path, 'wb') as f:
+                        f.write(data)
+                except Exception:
+                    continue
+
+            # 第二轮：解压 libs/{platform}/ 下的平台特定文件，覆盖通用文件
+            for file_path in zip_imp._files:
+                normalized = file_path.replace('\\', '/')
+                if not normalized.startswith('libs/'):
+                    continue
+                remaining = normalized[5:]
+                if not remaining.startswith(platform_prefix):
+                    continue
+                remaining = remaining[len(platform_prefix):]
+                if not remaining:
+                    continue
+
+                lower = remaining.lower()
+                if lower.endswith('.pyc') or lower.endswith('.pyo'):
+                    continue
+                if '/__pycache__/' in remaining:
+                    continue
+
+                try:
+                    data = zip_imp.get_data(file_path)
+                    parts = remaining.replace('/', os.sep)
+                    dir_part = os.path.dirname(parts)
+                    filename = os.path.basename(parts)
+                    # 只对 .pyd/.so 文件去掉版本标签
+                    name, ext = os.path.splitext(filename)
+                    if ext.lower() in ('.pyd', '.so'):
+                        filename = name.split('.')[0] + ext
+
+                    target_dir = os.path.join(temp_dir, dir_part) if dir_part else temp_dir
+                    os.makedirs(target_dir, exist_ok=True)
+                    target_path = os.path.join(target_dir, filename)
+                    with open(target_path, 'wb') as f:
+                        f.write(data)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        return temp_dir
+
+    @staticmethod
+    def _normalize_ext_filename_static(ext_filename: str) -> str:
+        """静态方法版本：规范化扩展模块文件名。"""
+        name, ext = os.path.splitext(ext_filename)
+        if ext.lower() in ('.pyd', '.so'):
+            base_name = name.split('.')[0]
+            return base_name + ext
+        return ext_filename
 
     @classmethod
     def _scan_bundled_modules(cls, zip_imp: zipimport.zipimporter) -> Tuple[Set[str], Dict[str, str]]:
@@ -92,25 +211,37 @@ class PluginImporter(importlib.abc.MetaPathFinder, importlib.abc.Loader):
                 is_platform_specific = remaining.startswith(platform_prefix)
                 if is_platform_specific:
                     remaining = remaining[len(platform_prefix):]
-                if not (remaining.endswith('.py') or remaining.endswith('.pyd') or remaining.endswith('.so')):
-                    continue
                 if not remaining:
                     continue
-                module_name = remaining.rsplit('.', 1)[0].replace('/', '.')
-                if module_name.endswith('.__init__'):
-                    module_name = module_name[:-9]
-                parts = module_name.split('.')
-                if len(parts) > 1 and parts[-1].startswith('cp'):
-                    module_name = '.'.join(parts[:-1])
-                if not module_name:
+                # 识别 Python 模块、扩展模块和 DLL 依赖
+                lower_remaining = remaining.lower()
+                is_python = remaining.endswith('.py')
+                is_binary = lower_remaining.endswith('.pyd') or lower_remaining.endswith('.so')
+                is_dep = lower_remaining.endswith('.dll') or lower_remaining.endswith('.dylib')
+                if not (is_python or is_binary or is_dep):
                     continue
-                is_binary = remaining.endswith(('.pyd', '.so'))
-                for i in range(len(parts)):
-                    bundled.add('.'.join(parts[:i + 1]))
-                if is_platform_specific and is_binary:
-                    resolved = '.'.join(parts[:-1]) if len(parts) > 1 and parts[-1].startswith('cp') else module_name
-                    if resolved not in platform_modules:
-                        platform_modules[resolved] = file_path
+                # 对 Python 和扩展模块计算模块名
+                if is_python or is_binary:
+                    module_name = remaining.rsplit('.', 1)[0].replace('/', '.')
+                    if module_name.endswith('.__init__'):
+                        module_name = module_name[:-9]
+                    parts = module_name.split('.')
+                    # 去掉 CPython 版本标签部分 (如 .cp312-win_amd64)
+                    if len(parts) > 1 and parts[-1].startswith('cp'):
+                        module_name = '.'.join(parts[:-1])
+                    if not module_name:
+                        continue
+                    for i in range(len(parts)):
+                        bundled.add('.'.join(parts[:i + 1]))
+                    if is_platform_specific and is_binary:
+                        resolved = '.'.join(parts[:-1]) if len(parts) > 1 and parts[-1].startswith('cp') else module_name
+                        if resolved not in platform_modules:
+                            platform_modules[resolved] = file_path
+                # DLL 依赖也需要注册到 bundled 集合中，以便验证
+                if is_dep:
+                    dep_name = remaining.rsplit('.', 1)[0].replace('/', '.')
+                    if dep_name:
+                        bundled.add(dep_name)
         except Exception:
             pass
         return bundled, platform_modules
@@ -121,6 +252,24 @@ class PluginImporter(importlib.abc.MetaPathFinder, importlib.abc.Loader):
         if package_name not in instance._plugin_importers:
             return False
         plugin_info = instance._plugin_importers[package_name]
+
+        # 清理预解压的临时目录
+        if plugin_info.ext_temp_dir:
+            if plugin_info.ext_temp_dir in sys.path:
+                sys.path.remove(plugin_info.ext_temp_dir)
+            # 关闭 DLL 搜索目录令牌
+            for token in plugin_info.dll_directory_tokens:
+                try:
+                    token.close()
+                except Exception:
+                    pass
+            # 清理临时目录
+            try:
+                import shutil
+                shutil.rmtree(plugin_info.ext_temp_dir, ignore_errors=True)
+            except Exception:
+                pass
+
         for mod_name in list(plugin_info.loaded_modules.keys()):
             sys.modules.pop(mod_name, None)
             instance._loaded_bundled.pop(mod_name, None)
@@ -244,41 +393,232 @@ class PluginImporter(importlib.abc.MetaPathFinder, importlib.abc.Loader):
         if code_data is None and ext_binary is None:
             raise ImportError(f"Module {module_path} not found in plugin {package_name}")
 
+        # 计算预解压目录中对应的真实路径
+        plugin_info = self._plugin_importers.get(package_name)
+        real_file_path = None
+        if plugin_info and plugin_info.ext_temp_dir:
+            module_rel_path = fullname.replace('.', os.sep)
+            if is_package:
+                real_file_path = os.path.join(plugin_info.ext_temp_dir, module_rel_path, '__init__.py')
+            else:
+                real_file_path = os.path.join(plugin_info.ext_temp_dir, module_rel_path + '.py')
+
         if is_extension and ext_binary is not None:
+            # 扩展模块优先从预解压目录加载
+            if plugin_info and plugin_info.ext_temp_dir:
+                ext_suffix = '.pyd' if platform.system() == 'Windows' else '.so'
+                ext_file = os.path.join(plugin_info.ext_temp_dir, module_rel_path + ext_suffix)
+                if os.path.isfile(ext_file):
+                    return self._load_extension_from_file(ext_file, fullname)
             return self._load_extension_module(ext_binary, file_path, fullname)
 
-        return self._load_python_module(code_data, file_path, fullname, is_package, package_name)
+        return self._load_python_module(code_data, file_path, fullname, is_package, package_name, real_file_path)
 
-    def _load_extension_module(self, ext_binary: bytes, file_path: str, fullname: str):
-        temp_dir = tempfile.mkdtemp(prefix='grmine_ext_')
-        ext_filename = os.path.basename(file_path.replace('\\', '/'))
-        temp_ext_path = os.path.join(temp_dir, ext_filename)
-        with open(temp_ext_path, 'wb') as f:
-            f.write(ext_binary)
-        spec = importlib.util.spec_from_file_location(fullname, temp_ext_path)
+    def _try_load_from_preextracted(self, ext_temp_dir: str, fullname: str, package_name: str):
+        """尝试从预解压目录加载模块，使 __file__ 指向真实路径。"""
+        module_path = fullname.replace('.', os.sep)
+
+        # 尝试作为包加载
+        init_path = os.path.join(ext_temp_dir, module_path, '__init__.py')
+        if os.path.isfile(init_path):
+            return self._load_python_file(init_path, fullname, is_package=True, package_name=package_name)
+
+        # 尝试作为模块加载
+        module_file = os.path.join(ext_temp_dir, module_path + '.py')
+        if os.path.isfile(module_file):
+            return self._load_python_file(module_file, fullname, is_package=False, package_name=package_name)
+
+        # 尝试作为扩展模块加载
+        ext_suffix = '.pyd' if platform.system() == 'Windows' else '.so'
+        ext_file = os.path.join(ext_temp_dir, module_path + ext_suffix)
+        if os.path.isfile(ext_file):
+            return self._load_extension_from_file(ext_file, fullname)
+
+        # 尝试隐式包（目录下有子模块但没有 __init__.py）
+        pkg_dir = os.path.join(ext_temp_dir, module_path)
+        if os.path.isdir(pkg_dir):
+            # 检查是否有任何 .py 或 .pyd/.so 文件
+            for entry in os.listdir(pkg_dir):
+                if entry.endswith('.py') or entry.endswith(ext_suffix):
+                    return self._load_python_file(None, fullname, is_package=True, package_name=package_name)
+
+        return None
+
+    def _load_python_file(self, file_path: Optional[str], fullname: str, is_package: bool, package_name: str):
+        """从真实文件路径加载 Python 模块，__file__ 指向真实路径。"""
+        module = types.ModuleType(fullname)
+        if file_path:
+            module.__file__ = file_path
+        module.__loader__ = self
+        module.__package__ = fullname if is_package else fullname.rpartition('.')[0]
+        if is_package:
+            module.__path__ = [os.path.dirname(file_path)] if file_path else []
+        spec = importlib.machinery.ModuleSpec(
+            fullname, self,
+            origin=file_path,
+            is_package=is_package,
+        )
+        if is_package:
+            spec.submodule_search_locations = [os.path.dirname(file_path)] if file_path else []
+        module.__spec__ = spec
+        sys.modules[fullname] = module
+        try:
+            if file_path:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    code_data = f.read()
+                code = compile(code_data, file_path, 'exec')
+                old_plugin = self.get_current_plugin()
+                if old_plugin != package_name:
+                    self.set_current_plugin(package_name)
+                try:
+                    exec(code, module.__dict__)
+                finally:
+                    if old_plugin != package_name:
+                        self.set_current_plugin(old_plugin)
+        except Exception as e:
+            sys.modules.pop(fullname, None)
+            raise ImportError(f"Error loading module {fullname}: {e}")
+        return module
+
+    def _load_extension_from_file(self, ext_path: str, fullname: str):
+        """从真实文件路径加载扩展模块。"""
+        spec = importlib.util.spec_from_file_location(fullname, ext_path)
         if spec and spec.loader:
             ext_module = importlib.util.module_from_spec(spec)
             sys.modules[fullname] = ext_module
             spec.loader.exec_module(ext_module)
-            ext_module.__file__ = "<zip>" + file_path
             ext_module.__loader__ = self
             return ext_module
-        raise ImportError(f"Cannot create spec for extension module {fullname}")
+        raise ImportError(f"Cannot create spec for extension module {fullname} from {ext_path}")
 
-    def _load_python_module(self, code_data: bytes, file_path: str, fullname: str, is_package: bool, package_name: str):
+    def _load_extension_module(self, ext_binary: bytes, file_path: str, fullname: str):
+        plugin_name = self.get_current_plugin()
+        plugin_info = self._plugin_importers.get(plugin_name) if plugin_name else None
+
+        temp_dir = tempfile.mkdtemp(prefix='grmine_ext_')
+
+        # 解压所有同平台的依赖 DLL/.so 到同一临时目录
+        if plugin_info:
+            self._extract_platform_deps(plugin_info, temp_dir)
+
+        # 规范化扩展模块文件名：去掉 CPython 版本标签使其可被 importlib 识别
+        ext_filename = os.path.basename(file_path.replace('\\', '/'))
+        ext_filename = self._normalize_ext_filename(ext_filename, fullname)
+        temp_ext_path = os.path.join(temp_dir, ext_filename)
+        with open(temp_ext_path, 'wb') as f:
+            f.write(ext_binary)
+
+        # 将临时目录加入 DLL 搜索路径，使扩展模块能找到其 C++ 依赖
+        _dll_search_dirs = []
+        if platform.system() == 'Windows':
+            if hasattr(os, 'add_dll_directory'):
+                _dll_search_dirs.append(os.add_dll_directory(temp_dir))
+            os.environ.setdefault('PATH', '')
+            old_path = os.environ['PATH']
+            os.environ['PATH'] = temp_dir + os.pathsep + old_path
+        else:
+            old_ld = os.environ.get('LD_LIBRARY_PATH', '')
+            os.environ['LD_LIBRARY_PATH'] = temp_dir + os.pathsep + old_ld
+
+        try:
+            spec = importlib.util.spec_from_file_location(fullname, temp_ext_path)
+            if spec and spec.loader:
+                ext_module = importlib.util.module_from_spec(spec)
+                sys.modules[fullname] = ext_module
+                spec.loader.exec_module(ext_module)
+                ext_module.__file__ = "<zip>" + file_path
+                ext_module.__loader__ = self
+                return ext_module
+            raise ImportError(f"Cannot create spec for extension module {fullname}")
+        finally:
+            # 还原环境变量（add_dll_directory 返回的令牌自动失效）
+            if platform.system() == 'Windows':
+                os.environ['PATH'] = old_path
+                for d in _dll_search_dirs:
+                    try:
+                        d.close()
+                    except Exception:
+                        pass
+            else:
+                os.environ['LD_LIBRARY_PATH'] = old_ld
+
+    def _normalize_ext_filename(self, ext_filename: str, fullname: str) -> str:
+        """将含 CPython 版本标签的文件名规范化为 importlib 可识别的名称。
+        例如: _curl.cp312-win_amd64.pyd -> _curl.pyd
+        """
+        name, ext = os.path.splitext(ext_filename)
+        if ext.lower() in ('.pyd', '.so'):
+            # 去掉 .so 文件中的版本后缀如 .cpython-312-x86_64-linux-gnu
+            # 以及 .pyd 中的 .cp312-win_amd64
+            base_name = name.split('.')[0]
+            return base_name + ext
+        return ext_filename
+
+    def _extract_platform_deps(self, plugin_info: 'PluginInfo', temp_dir: str) -> None:
+        """将插件中同平台的所有 .dll/.so 依赖解压到临时目录。"""
+        current_platform = self._current_platform
+        platform_prefix = f"{current_platform}/"
+        zip_imp = plugin_info.zip_importer
+
+        try:
+            for file_path in zip_imp._files:
+                normalized = file_path.replace('\\', '/')
+                if not normalized.startswith('libs/'):
+                    continue
+                remaining = normalized[5:]
+
+                # 只处理当前平台的文件
+                is_platform_specific = remaining.startswith(platform_prefix)
+                if is_platform_specific:
+                    remaining = remaining[len(platform_prefix):]
+                else:
+                    continue
+
+                lower = remaining.lower()
+                # 提取 .dll, .pyd, .so 等二进制依赖
+                is_dep = (
+                    lower.endswith('.dll') or
+                    lower.endswith('.pyd') or
+                    lower.endswith('.so') or
+                    lower.endswith('.dylib')
+                )
+                if not is_dep:
+                    continue
+
+                try:
+                    data = zip_imp.get_data(file_path)
+                    dep_filename = os.path.basename(remaining)
+                    dep_path = os.path.join(temp_dir, dep_filename)
+                    if not os.path.exists(dep_path):
+                        with open(dep_path, 'wb') as f:
+                            f.write(data)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _load_python_module(self, code_data: bytes, file_path: str, fullname: str, is_package: bool, package_name: str, real_file_path: Optional[str] = None):
         module = types.ModuleType(fullname)
-        module.__file__ = "<zip>" + file_path
+        # 优先使用真实文件路径，使 os.path.dirname(__file__) 能找到同目录的 .pyd
+        if real_file_path and os.path.isfile(real_file_path):
+            module.__file__ = real_file_path
+        else:
+            module.__file__ = "<zip>" + file_path
         module.__loader__ = self
         module.__package__ = fullname if is_package else fullname.rpartition('.')[0]
         if is_package:
-            module.__path__ = []
+            # __path__ 必须包含真实目录，使子模块的 os.path.dirname(__file__) 正确
+            if real_file_path:
+                module.__path__ = [os.path.dirname(real_file_path)]
+            else:
+                module.__path__ = []
         spec = importlib.machinery.ModuleSpec(
             fullname, self,
-            origin="<zip>" + file_path,
+            origin=module.__file__,
             is_package=is_package,
         )
         if is_package:
-            spec.submodule_search_locations = []
+            spec.submodule_search_locations = module.__path__
         module.__spec__ = spec
         sys.modules[fullname] = module
         try:

@@ -11,12 +11,42 @@ from typing import Dict, List, Optional, Set
 
 
 PLATFORMS = {
-    'win-amd64': ['win_amd64', 'win32'],
-    'win-x86': ['win32'],
-    'linux-x86_64': ['manylinux', 'linux'],
-    'linux-aarch64': ['manylinux_aarch64', 'linux_aarch64'],
-    'macos-x86_64': ['macosx', 'darwin'],
-    'macos-arm64': ['macosx_arm64', 'darwin_arm64'],
+    'win-amd64': {
+        'pip_tags': ['win_amd64', 'win32'],
+        'pip_platform': 'win_amd64',
+        'ext_suffix': '.pyd',
+        'dep_suffixes': ['.pyd', '.dll'],
+    },
+    'win-x86': {
+        'pip_tags': ['win32'],
+        'pip_platform': 'win32',
+        'ext_suffix': '.pyd',
+        'dep_suffixes': ['.pyd', '.dll'],
+    },
+    'linux-x86_64': {
+        'pip_tags': ['manylinux', 'linux'],
+        'pip_platform': 'manylinux2014_x86_64',
+        'ext_suffix': '.so',
+        'dep_suffixes': ['.so'],
+    },
+    'linux-aarch64': {
+        'pip_tags': ['manylinux_aarch64', 'linux_aarch64'],
+        'pip_platform': 'manylinux2014_aarch64',
+        'ext_suffix': '.so',
+        'dep_suffixes': ['.so'],
+    },
+    'macos-x86_64': {
+        'pip_tags': ['macosx', 'darwin'],
+        'pip_platform': 'macosx_10_9_x86_64',
+        'ext_suffix': '.so',
+        'dep_suffixes': ['.so', '.dylib'],
+    },
+    'macos-arm64': {
+        'pip_tags': ['macosx_arm64', 'darwin_arm64'],
+        'pip_platform': 'macosx_11_0_arm64',
+        'ext_suffix': '.so',
+        'dep_suffixes': ['.so', '.dylib'],
+    },
 }
 
 DEFAULT_PLATFORMS = ['win-amd64', 'linux-x86_64', 'macos-x86_64']
@@ -104,37 +134,79 @@ class PluginBuilder:
             return ['linux-x86_64']
     
     def _download_for_platforms(self, module_name: str, package_spec: str, libs_dir: Path, target_platforms: List[str]) -> bool:
+        # 先尝试下载纯 Python wheel（所有平台通用）
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             
-            print(f"    Downloading dependencies...")
+            print(f"    Downloading pure-python wheel for {package_spec}...")
             result = subprocess.run(
-                [sys.executable, "-m", "pip", "download", 
-                 "--dest", str(temp_path), package_spec],
+                [sys.executable, "-m", "pip", "download",
+                 "--dest", str(temp_path), "--only-binary=:all:", package_spec],
                 capture_output=True, text=True, timeout=300
             )
             
-            if result.returncode != 0:
-                print(f"      Error downloading {package_spec}: {result.stderr.strip()}")
-                return False
+            pure_wheels = []
+            if result.returncode == 0:
+                pure_wheels = [f for f in temp_path.glob("*.whl")
+                               if f.name.endswith('none-any.whl')]
             
-            wheel_files = list(temp_path.glob("*.whl"))
-            source_files = list(temp_path.glob("*.tar.gz")) + list(temp_path.glob("*.zip"))
-            
-            if not wheel_files and not source_files:
-                print(f"      Warning: No distributable files found for {package_spec}")
-                return False
-            
-            success = False
-            for wheel_file in wheel_files:
+            for wheel_file in pure_wheels:
                 self._extract_wheel(wheel_file, libs_dir, module_name, target_platforms)
-                success = True
             
-            for source_file in source_files:
-                self._extract_source(source_file, libs_dir, module_name)
-                success = True
+            # 如果纯 Python wheel 已包含全部内容，无需下载平台特定 wheel
+            if pure_wheels:
+                has_more = self._check_if_platform_specific_needed(module_name, pure_wheels)
+                if not has_more:
+                    print(f"      {module_name} is pure-python, no platform-specific wheels needed")
+                    return True
+        
+        # 为每个目标平台下载平台特定的 wheel
+        all_success = bool(pure_wheels)
+        py_version = f"{sys.version_info.major}{sys.version_info.minor}"
+        
+        for target_platform in target_platforms:
+            platform_info = PLATFORMS.get(target_platform)
+            if not platform_info:
+                print(f"      Warning: Unknown platform {target_platform}, skipping")
+                continue
             
-            return success
+            pip_platform = platform_info['pip_platform']
+            
+            with tempfile.TemporaryDirectory() as temp_dir:
+                temp_path = Path(temp_dir)
+                
+                print(f"    Downloading for {target_platform} ({pip_platform})...")
+                result = subprocess.run(
+                    [sys.executable, "-m", "pip", "download",
+                     "--dest", str(temp_path),
+                     "--platform", pip_platform,
+                     "--python-version", py_version,
+                     "--only-binary=:all:",
+                     "--no-deps",
+                     package_spec],
+                    capture_output=True, text=True, timeout=300
+                )
+                
+                if result.returncode != 0:
+                    print(f"      No platform-specific wheel for {target_platform}: {result.stderr.strip()}")
+                    continue
+                
+                wheel_files = list(temp_path.glob("*.whl"))
+                for wheel_file in wheel_files:
+                    self._extract_platform_wheel(wheel_file, libs_dir, module_name, target_platform, platform_info)
+                    all_success = True
+        
+        return all_success
+    
+    def _check_if_platform_specific_needed(self, module_name: str, pure_wheels: List[Path]) -> bool:
+        """检查纯 Python wheel 是否包含扩展模块，如果不包含则需要平台特定 wheel。"""
+        import zipfile
+        for whl in pure_wheels:
+            with zipfile.ZipFile(whl, 'r') as zf:
+                for name in zf.namelist():
+                    if name.endswith(('.pyd', '.so', '.dll')):
+                        return True
+        return False
     
     def _extract_wheel(self, wheel_path: Path, libs_dir: Path, module_name: str, target_platforms: List[str]) -> None:
         import zipfile
@@ -182,6 +254,53 @@ class PluginBuilder:
                     extracted_files.add(member)
         
         print(f"      Bundled: {module_name}")
+    
+    def _extract_platform_wheel(self, wheel_path: Path, libs_dir: Path, module_name: str, target_platform: str, platform_info: dict) -> None:
+        """提取平台特定的 wheel，将二进制文件放到 libs/{platform}/ 下，纯 Python 文件放到 libs/ 下。"""
+        import zipfile
+        
+        wheel_name = wheel_path.name
+        dep_suffixes = platform_info.get('dep_suffixes', [])
+        
+        print(f"      Extracting platform wheel {wheel_name} for {target_platform}...")
+        
+        platform_libs_dir = libs_dir / target_platform
+        extracted_files: Set[str] = set()
+        
+        with zipfile.ZipFile(wheel_path, 'r') as zf:
+            for member in zf.namelist():
+                if member.endswith('/'):
+                    continue
+                
+                if member.endswith('.pyc') or member.endswith('.pyo'):
+                    continue
+                
+                if '.dist-info/' in member or '-info/' in member:
+                    continue
+                
+                if member in extracted_files:
+                    continue
+                
+                member_lower = member.lower()
+                is_binary = any(member_lower.endswith(s) for s in dep_suffixes)
+                
+                if is_binary:
+                    # 二进制文件放到 libs/{platform}/ 下
+                    target_path = platform_libs_dir / member
+                    target_path.parent.mkdir(parents=True, exist_ok=True)
+                    with zf.open(member) as src, open(target_path, 'wb') as dst:
+                        dst.write(src.read())
+                    extracted_files.add(f"{target_platform}/{member}")
+                else:
+                    # 纯 Python 文件放到 libs/ 下（如果尚未存在）
+                    target_path = libs_dir / member
+                    if not target_path.exists():
+                        target_path.parent.mkdir(parents=True, exist_ok=True)
+                        with zf.open(member) as src, open(target_path, 'wb') as dst:
+                            dst.write(src.read())
+                    extracted_files.add(member)
+        
+        print(f"      Bundled (platform): {module_name} for {target_platform}")
     
     def _extract_source(self, source_path: Path, libs_dir: Path, module_name: str) -> None:
         import tarfile
@@ -260,13 +379,18 @@ class PluginBuilder:
                 any((libs_dir / module_path).parent.glob(f"{module_path.split(os.sep)[-1]}*"))
             )
             
+            # 也检查平台特定目录中的二进制模块
             if not found:
-                platform_dir = libs_dir / self._get_default_platforms()[0] if self._get_default_platforms() else None
-                if platform_dir:
-                    found = (
-                        (platform_dir / module_path / "__init__.py").exists() or
-                        (platform_dir / f"{module_path}.py").exists()
-                    )
+                for plat_key in PLATFORMS:
+                    platform_dir = libs_dir / plat_key
+                    if platform_dir.exists():
+                        found = (
+                            (platform_dir / module_path / "__init__.py").exists() or
+                            (platform_dir / f"{module_path}.py").exists() or
+                            any(platform_dir.rglob(f"{module_path.split(os.sep)[-1]}*"))
+                        )
+                        if found:
+                            break
             
             if not found:
                 print(f"      ERROR: Bundled module '{import_name}' not found in libs/ after extraction!")
