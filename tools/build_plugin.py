@@ -133,15 +133,31 @@ class PluginBuilder:
                 return ['linux-aarch64']
             return ['linux-x86_64']
     
+    def _get_min_python_version(self) -> Optional[str]:
+        """从 info.json 的 python_version 字段提取最低 Python 版本号。
+        例如 '>=3.8' -> '38', '>=3.10' -> '310'"""
+        pv = self.info.get("python_version", "")
+        import re
+        m = re.search(r'(\d+)\.(\d+)', pv)
+        if m:
+            return f"{m.group(1)}{m.group(2)}"
+        return None
+
     def _download_for_platforms(self, module_name: str, package_spec: str, libs_dir: Path, target_platforms: List[str]) -> bool:
+        # 获取目标最低 Python 版本，确保依赖解析兼容
+        min_py_ver = self._get_min_python_version()
         # 先尝试下载纯 Python wheel（所有平台通用）
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             
             print(f"    Downloading pure-python wheel for {package_spec}...")
+            pip_cmd = [sys.executable, "-m", "pip", "download",
+                       "--dest", str(temp_path), "--only-binary=:all:"]
+            if min_py_ver:
+                pip_cmd.extend(["--python-version", min_py_ver])
+            pip_cmd.append(package_spec)
             result = subprocess.run(
-                [sys.executable, "-m", "pip", "download",
-                 "--dest", str(temp_path), "--only-binary=:all:", package_spec],
+                pip_cmd,
                 capture_output=True, text=True, timeout=300
             )
             
