@@ -71,10 +71,12 @@ class PluginImporter(importlib.abc.MetaPathFinder, importlib.abc.Loader):
         libs_prefix = f"grapi.plugin_libs.{plugin_hash}"
         bundled_modules, platform_modules = cls._scan_bundled_modules(zip_importer)
 
-        # 如果有平台特定的二进制模块，预解压到临时目录
+        # 只要有 bundled 模块就预解压到临时目录
+        # 原因：即使没有 C++ 扩展，包内也可能有非 Python 资源文件（如 .lua, .json 等），
+        # importlib.resources 需要通过文件系统路径来访问这些资源
         ext_temp_dir = None
         dll_directory_tokens = []
-        if platform_modules:
+        if bundled_modules:
             ext_temp_dir = cls._preextract_platform_libs(zip_importer)
             if ext_temp_dir:
                 # 将临时目录加入 sys.path，使 Python 标准导入和 ctypes 都能找到模块
@@ -298,6 +300,14 @@ class PluginImporter(importlib.abc.MetaPathFinder, importlib.abc.Loader):
         if current_plugin and current_plugin in self._plugin_importers:
             plugin_info = self._plugin_importers[current_plugin]
             if fullname in plugin_info.bundled_modules:
+                # 如果有预解压目录且该模块在文件系统中存在，优先让标准 import 机制处理
+                # 这样 importlib.resources 能正常工作
+                if plugin_info.ext_temp_dir:
+                    module_path = fullname.replace('.', os.sep)
+                    pkg_init = os.path.join(plugin_info.ext_temp_dir, module_path, '__init__.py')
+                    mod_file = os.path.join(plugin_info.ext_temp_dir, module_path + '.py')
+                    if os.path.isfile(pkg_init) or os.path.isfile(mod_file):
+                        return None  # 让标准 import 机制通过 sys.path 处理
                 return importlib.machinery.ModuleSpec(
                     fullname, self,
                     origin=f"<plugin:{current_plugin}:libs/{fullname.replace('.', '/')}>"
@@ -607,11 +617,23 @@ class PluginImporter(importlib.abc.MetaPathFinder, importlib.abc.Loader):
         module.__loader__ = self
         module.__package__ = fullname if is_package else fullname.rpartition('.')[0]
         if is_package:
-            # __path__ 必须包含真实目录，使子模块的 os.path.dirname(__file__) 正确
+            # __path__ 需要同时包含 zip 路径和文件系统路径：
+            # - zip 路径使 importlib.resources 能找到包内资源文件
+            # - 文件系统路径使 os.path.dirname(__file__) 能找到同目录的 .pyd
+            plugin_info = self._plugin_importers.get(package_name)
+            path_entries = []
+            # 添加 zip 路径（用于 importlib.resources 访问包内资源）
+            zip_imp = plugin_info.zip_importer if plugin_info else None
+            if zip_imp:
+                module_rel = fullname.replace('.', '/')
+                zip_path = f"{zip_imp.archive}{os.sep}libs{os.sep}{module_rel}"
+                path_entries.append(zip_path)
+            # 添加文件系统路径（用于 C++ 扩展的 DLL 查找）
             if real_file_path:
-                module.__path__ = [os.path.dirname(real_file_path)]
-            else:
-                module.__path__ = []
+                fs_dir = os.path.dirname(real_file_path)
+                if fs_dir not in path_entries:
+                    path_entries.append(fs_dir)
+            module.__path__ = path_entries
         spec = importlib.machinery.ModuleSpec(
             fullname, self,
             origin=module.__file__,
